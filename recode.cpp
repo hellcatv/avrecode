@@ -139,6 +139,13 @@ class av_decoder {
       self->cabac_contexts[ctx].reset(cabac_decoder);
       return cabac_decoder;
     }
+    static void set_h264_context(void *opaque, const struct H264Context *ctx) {
+      auto *self = static_cast<typename Driver::cabac_decoder*>(opaque);
+      return self->set_h264_context(ctx);
+    }
+    static void set_hevc_context(void *opaque, const struct HEVCContext *ctx) {
+      throw std::runtime_error("Not implemented: Unable to operate on HEVC videos");
+    }
     static int get(void *opaque, uint8_t *state) {
       auto *self = static_cast<typename Driver::cabac_decoder*>(opaque);
       return self->get(state);
@@ -160,6 +167,8 @@ class av_decoder {
   AVFormatContext *format_ctx;
   AVCodecCodingHooks coding_hooks = { this, {
       cabac::init_decoder,
+      cabac::set_h264_context,
+      cabac::set_hevc_context,
       cabac::get,
       cabac::get_bypass,
       cabac::get_terminate,
@@ -179,6 +188,7 @@ class h264_model {
   h264_model() { reset(); }
 
   void reset() {
+    h264context = NULL;
     estimators.clear();
     estimators[&terminate_context].neg = 0x180 / 2;
   }
@@ -201,12 +211,16 @@ class h264_model {
       e->neg = (e->neg + 1) / 2;
     }
   }
+  void set_h264_context(const struct H264Context *ctx) {
+    h264context = ctx;
+  }
 
   const uint8_t bypass_context = 0, terminate_context = 0;
 
  private:
   struct estimator { int pos = 1, neg = 1; };
   std::map<const void*, estimator> estimators;
+  const struct H264Context *h264context;
 };
 
 
@@ -294,7 +308,9 @@ class compressor {
       }
       return symbol;
     }
-
+    void set_h264_context(const struct H264Context *ctx) {
+      model->set_h264_context(ctx);
+    }
    private:
     Recoded::Block *out;
     CABACContext ctx;
@@ -469,6 +485,9 @@ class decompressor {
         finish();
       }
       return symbol;
+    }
+    void set_h264_context(const struct H264Context *ctx) {
+      model->set_h264_context(ctx);
     }
 
    private:
