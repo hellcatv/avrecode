@@ -185,21 +185,23 @@ typedef arithmetic_code<range_t, uint8_t> recoded_code;
 
 class h264_model {
  public:
-  h264_model() { reset(); }
+    h264_model() { fprintf(stderr, "Model setup\n"); reset(); }
 
   void reset() {
-    h264context = NULL;
-    estimators.clear();
+      fprintf(stderr, "Model reset\n");
+      //estimators.clear();
     estimators[&terminate_context].neg = 0x180 / 2;
   }
 
-  range_t probability_for_state(range_t range, const void *context) {
+  range_t probability_for_state(range_t range, const void *context,
+                                const struct H264Context*ctx) {
     auto* e = &estimators[context];
     int total = e->pos + e->neg;
     return (range/total) * e->pos;
   }
 
-  void update_state(int symbol, const void *context) {
+  void update_state(int symbol, const void *context,
+                    const struct H264Context*ctx) {
     auto* e = &estimators[context];
     if (symbol) {
       e->pos++;
@@ -211,16 +213,11 @@ class h264_model {
       e->neg = (e->neg + 1) / 2;
     }
   }
-  void set_h264_context(const struct H264Context *ctx) {
-    h264context = ctx;
-  }
 
   const uint8_t bypass_context = 0, terminate_context = 0;
-
  private:
   struct estimator { int pos = 1, neg = 1; };
   std::map<const void*, estimator> estimators;
-  const struct H264Context *h264context;
 };
 
 
@@ -259,6 +256,7 @@ class compressor {
   class cabac_decoder {
    public:
     cabac_decoder(compressor *c, CABACContext *ctx_in, const uint8_t *buf, int size) {
+      h264_context = nullptr;
       out = c->find_next_coded_block_and_emit_literal(buf, size);
       if (out == nullptr) {
         // We're skipping this block, so disable calls to our hooks.
@@ -283,16 +281,16 @@ class compressor {
     int get(uint8_t *state) {
       int symbol = ::ff_get_cabac(&ctx, state);
       encoder.put(symbol, [&](range_t range){
-          return model->probability_for_state(range, state); });
-      model->update_state(symbol, state);
+          return model->probability_for_state(range, state, h264_context); });
+      model->update_state(symbol, state, h264_context);
       return symbol;
     }
 
     int get_bypass() {
       int symbol = ::ff_get_cabac_bypass(&ctx);
       encoder.put(symbol, [&](range_t range){
-          return model->probability_for_state(range, &model->bypass_context); });
-      model->update_state(symbol, &model->bypass_context);
+          return model->probability_for_state(range, &model->bypass_context, h264_context); });
+      model->update_state(symbol, &model->bypass_context, h264_context);
       return symbol;
     }
 
@@ -300,8 +298,8 @@ class compressor {
       int n = ::ff_get_cabac_terminate(&ctx);
       int symbol = (n != 0);
       encoder.put(symbol, [&](range_t range){
-          return model->probability_for_state(range, &model->terminate_context); });
-      model->update_state(symbol, &model->terminate_context);
+          return model->probability_for_state(range, &model->terminate_context, h264_context); });
+      model->update_state(symbol, &model->terminate_context, h264_context);
       if (symbol) {
         encoder.finish();
         out->set_cabac(&encoder_out[0], encoder_out.size());
@@ -309,13 +307,14 @@ class compressor {
       return symbol;
     }
     void set_h264_context(const struct H264Context *ctx) {
-      model->set_h264_context(ctx);
+      h264_context = ctx;
     }
    private:
     Recoded::Block *out;
     CABACContext ctx;
 
     h264_model *model;
+    const struct H264Context *h264_context;
     std::vector<uint8_t> encoder_out;
     recoded_code::encoder<std::back_insert_iterator<std::vector<uint8_t>>, uint8_t> encoder{
       std::back_inserter(encoder_out)};
@@ -441,6 +440,7 @@ class decompressor {
   class cabac_decoder {
    public:
     cabac_decoder(decompressor *d, CABACContext *ctx_in, const uint8_t *buf, int size) {
+      h264_context = nullptr;
       index = d->recognize_coded_block(buf, size);
       block = &d->in.block(index);
       out = &d->blocks[index];
@@ -462,24 +462,24 @@ class decompressor {
 
     int get(uint8_t *state) {
       int symbol = decoder->get([&](range_t range){
-          return model->probability_for_state(range, state); });
-      model->update_state(symbol, state);
+          return model->probability_for_state(range, state, h264_context); });
+      model->update_state(symbol, state, h264_context);
       cabac_encoder.put(symbol, state);
       return symbol;
     }
 
     int get_bypass() {
       int symbol = decoder->get([&](range_t range){
-          return model->probability_for_state(range, &model->bypass_context); });
-      model->update_state(symbol, &model->bypass_context);
+          return model->probability_for_state(range, &model->bypass_context, h264_context); });
+      model->update_state(symbol, &model->bypass_context, h264_context);
       cabac_encoder.put_bypass(symbol);
       return symbol;
     }
 
     int get_terminate() {
       int symbol = decoder->get([&](range_t range){
-          return model->probability_for_state(range, &model->terminate_context); });
-      model->update_state(symbol, &model->terminate_context);
+          return model->probability_for_state(range, &model->terminate_context, h264_context); });
+      model->update_state(symbol, &model->terminate_context, h264_context);
       cabac_encoder.put_terminate(symbol);
       if (symbol) {
         finish();
@@ -487,7 +487,7 @@ class decompressor {
       return symbol;
     }
     void set_h264_context(const struct H264Context *ctx) {
-      model->set_h264_context(ctx);
+      h264_context = ctx;
     }
 
    private:
@@ -510,6 +510,7 @@ class decompressor {
     std::vector<uint8_t> cabac_out;
     cabac::encoder<std::back_insert_iterator<std::vector<uint8_t>>> cabac_encoder{
       std::back_inserter(cabac_out)};
+    const struct H264Context *h264_context;
   };
 
  private:
