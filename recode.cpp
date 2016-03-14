@@ -178,31 +178,46 @@ class av_decoder {
   std::map<CABACContext*, std::unique_ptr<typename Driver::cabac_decoder>> cabac_contexts;
 };
 
-
+struct ContextKey {
+    enum BitState {
+        ZERO,
+        ONE,
+        UNSET,
+    };
+    const void * cabac_context;
+    uint8_t index;
+    BitState prior;
+    bool operator <(const ContextKey &other) const {
+        if (cabac_context != other.cabac_context) {
+            return cabac_context < other.cabac_context;
+        }
+        if (index != other.index) {
+            return index < other.index;
+        }
+        return prior < other.prior;
+    }
+};
 // Encoder / decoder for recoded CABAC blocks.
 typedef uint64_t range_t;
 typedef arithmetic_code<range_t, uint8_t> recoded_code;
 
 class h264_model {
  public:
-    h264_model() { fprintf(stderr, "Model setup\n"); reset(); }
+    h264_model() {reset(); }
 
   void reset() {
-      fprintf(stderr, "Model reset\n");
       //estimators.clear();
-    estimators[&terminate_context].neg = 0x180 / 2;
   }
-
   range_t probability_for_state(range_t range, const void *context,
                                 const struct H264Context*ctx) {
-    auto* e = &estimators[context];
+    auto *e = &lookup_estimator(context, ctx);
     int total = e->pos + e->neg;
     return (range/total) * e->pos;
   }
 
   void update_state(int symbol, const void *context,
                     const struct H264Context*ctx) {
-    auto* e = &estimators[context];
+    auto* e = &lookup_estimator(context, ctx);
     if (symbol) {
       e->pos++;
     } else {
@@ -217,7 +232,24 @@ class h264_model {
   const uint8_t bypass_context = 0, terminate_context = 0;
  private:
   struct estimator { int pos = 1, neg = 1; };
-  std::map<const void*, estimator> estimators;
+  std::map<ContextKey, estimator> estimators;
+  estimator& lookup_estimator(const void * contxt,
+                              const struct H264Context *ctx) {
+      ContextKey key;
+      key.cabac_context = contxt;
+      key.index = 0;
+      key.prior = ContextKey::UNSET;
+      auto where = estimators.find(key);
+      if (where!= estimators.end()) {
+          return where->second;
+      }
+      auto *retval = &estimators[key];
+      /*
+      if (contxt == &bypass_context) {
+          retval->neg = 0x180 / 2; // seems to have no effect on the outcome
+      }*/
+      return *retval;
+  }
 };
 
 
