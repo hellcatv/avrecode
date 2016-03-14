@@ -15,6 +15,10 @@ extern "C" {
 #include "libavformat/avio.h"
 #include "libavutil/error.h"
 #include "libavutil/file.h"
+#define new new_
+#include "libavcodec/h264.h"
+#undef new
+
 }
 
 #include "arithmetic_code.h"
@@ -139,9 +143,9 @@ class av_decoder {
       self->cabac_contexts[ctx].reset(cabac_decoder);
       return cabac_decoder;
     }
-    static void set_h264_context(void *opaque, const struct H264Context *ctx) {
+    static void set_h264_context(void *opaque, const struct H264Context *ctx, const struct H264SliceContext *slice_ctx) {
       auto *self = static_cast<typename Driver::cabac_decoder*>(opaque);
-      return self->set_h264_context(ctx);
+      return self->set_h264_context(ctx, slice_ctx);
     }
     static void set_hevc_context(void *opaque, const struct HEVCContext *ctx) {
       throw std::runtime_error("Not implemented: Unable to operate on HEVC videos");
@@ -180,9 +184,9 @@ class av_decoder {
 
 struct ContextKey {
     enum BitState {
-        ZERO,
+        UNSET, // so we can bzero this
         ONE,
-        UNSET,
+        ZERO,
     };
     const void * cabac_context;
     uint8_t index;
@@ -200,45 +204,171 @@ struct ContextKey {
 // Encoder / decoder for recoded CABAC blocks.
 typedef uint64_t range_t;
 typedef arithmetic_code<range_t, uint8_t> recoded_code;
+template <class T> class buffer3d {
+    std::vector<T> data;
+    unsigned int dimx;
+    unsigned int dimy;
+    unsigned int dimz;
+    void recopy(unsigned int sizey, unsigned int sizex) {
+        buffer3d retval(dimz, sizey, sizex);
+        for (unsigned int z = 0; z < dimz; ++z) {
+            for (unsigned int y = 0; y < dimy; ++y) {
+                for (unsigned int x = 0; x < dimx; ++x) {
+                    retval.at(z, y, x) = read(z, y, x);
+                }
+            }
+        }
+        data.swap(retval.data);
+        dimx = retval.dimx;
+        dimy = retval.dimy;
+        dimz = retval.dimz;
+    }
+ public:
+    buffer3d(unsigned int sizez=0, unsigned int sizey=0, unsigned int sizex=0) :
+        data(sizez * sizey * sizex) {
+        dimx = sizex;
+        dimy = sizey;
+        dimz = sizez;
+    }
+    void ensure_index_ok(unsigned int z, unsigned int y, unsigned int x) {
+        if (y >= dimy || x >= dimx) {
+            recopy(std::max(dimy, y + 1), std::max(dimx, x + 1));
+        }
+        if (z >= dimz) {
+            dimz = z + 1;
+            data.resize(dimx * dimy * dimz);
+        }
+    }
+    T& at(unsigned int z, unsigned int y, unsigned int x) {
+        ensure_index_ok(z, y, x);
+        return data[x + y * dimx + z * dimy * dimx];
+    }
+    T read(unsigned int z, unsigned int y, unsigned int x) const {
+        if (y >= dimy || x >= dimx || z >= dimz) {
+            return T();
+        }
+        return data[x + y * dimx + z * dimy * dimx];
+    }
+    void set_to(T val) {
+        for (auto i = data.begin(), ie = data.end(); i != ie; ++i) {
+            *i = val;
+        }
+    }
+    unsigned int length_x() const {
+        return dimx;
+    }
+    unsigned int length_y() const {
+        return dimy;
+    }
+    unsigned int length_z() const {
+        return dimz;
+    }
+};
 
 class h264_model {
+  struct framebuffer_history {
+    std::map<const void *, buffer3d<ContextKey::BitState> > history;
+    void set_to(ContextKey::BitState val) {
+      for (auto i = history.begin(), ie = history.end(); i != ie; ++i) {
+        i->second.set_to(val);
+      }
+    }
+    void set_height_width(unsigned int dimy, unsigned int dimx) {
+      if (!dimy || !dimx) {
+        return;
+      }
+      for (auto i = history.begin(), ie = history.end(); i != ie; ++i) {
+        i->second.ensure_index_ok(0, dimy - 1, dimx - 1);
+      }
+    }
+    unsigned int next_index(const void *ctx, unsigned int y, unsigned int x) {
+      auto * frame = &history[ctx];
+      for (unsigned int i = 0;i < frame->length_z(); ++i) {
+        if (frame->at(i, y, x) == ContextKey::BitState()) {
+          return i;
+        }
+      }
+      return frame->length_z();
+    }
+  };
+  framebuffer_history frames[2];
+  int cur_frame;
+  int cur_h264_frame;
  public:
-    h264_model() {reset(); }
-
-  void reset() {
+  h264_model() {
+    cur_frame = 0;
+    cur_h264_frame = -1;
+    frames[0].set_to(ContextKey::UNSET);
+    frames[1].set_to(ContextKey::UNSET);
+    reset(nullptr);
+  }
+  void check_new_frame(const H264Context *ctx) {
+      if (cur_h264_frame != ctx->frame_num) {
+          cur_h264_frame = ctx->frame_num;
+          cur_frame = cur_frame ? 0 : 1;
+          frames[cur_frame].set_to(ContextKey::UNSET);
+          frames[cur_frame].set_height_width(ctx->mb_height, ctx->mb_width);
+      }
+  }
+  void reset(const H264Context *ctx) {
+      if (ctx) {
+          check_new_frame(ctx);
+      }
       //estimators.clear();
   }
   range_t probability_for_state(range_t range, const void *context,
-                                const struct H264Context*ctx) {
-    auto *e = &lookup_estimator(context, ctx);
+                                const struct H264Context*ctx,
+                                const struct H264SliceContext*slice_ctx) {
+    unsigned int index = 0;
+    auto *e = &lookup_estimator(context, ctx, slice_ctx, &index);
     int total = e->pos + e->neg;
     return (range/total) * e->pos;
   }
 
   void update_state(int symbol, const void *context,
-                    const struct H264Context*ctx) {
-    auto* e = &lookup_estimator(context, ctx);
-    if (symbol) {
-      e->pos++;
-    } else {
-      e->neg++;
+                    const struct H264Context*ctx,
+                    const struct H264SliceContext*slice_ctx) {
+    unsigned int index = 0;
+    unsigned int mb_x = slice_ctx->mb_x;
+    unsigned int mb_y = slice_ctx->mb_y;
+    {
+      auto* e = &lookup_estimator(context, ctx, slice_ctx, &index);
+      if (symbol) {
+        e->pos++;
+      } else {
+        e->neg++;
+      }
+      if (e->pos + e->neg > 0x60) {
+        e->pos = (e->pos + 1) / 2;
+        e->neg = (e->neg + 1) / 2;
+      }
     }
-    if (e->pos + e->neg > 0x60) {
-      e->pos = (e->pos + 1) / 2;
-      e->neg = (e->neg + 1) / 2;
-    }
+    frames[cur_frame].history[context].at(index, mb_y, mb_x) = symbol ? ContextKey::ONE : ContextKey::ZERO;
   }
 
   const uint8_t bypass_context = 0, terminate_context = 0;
  private:
   struct estimator { int pos = 1, neg = 1; };
   std::map<ContextKey, estimator> estimators;
-  estimator& lookup_estimator(const void * contxt,
-                              const struct H264Context *ctx) {
+  ContextKey make_model_key(const void * contxt,
+                              const struct H264Context *ctx,
+                              const struct H264SliceContext *slice_ctx,
+                              unsigned int *index) {
+      unsigned int mb_x = slice_ctx->mb_x;
+      unsigned int mb_y = slice_ctx->mb_y;
+      *index = frames[cur_frame].next_index(contxt, mb_y, mb_x);
       ContextKey key;
       key.cabac_context = contxt;
-      key.index = 0;
-      key.prior = ContextKey::UNSET;
+      key.index = *index;
+      key.prior = frames[cur_frame ? 0 : 1].history[contxt].read(*index, mb_y, mb_x);
+      return key;
+  }
+  estimator& lookup_estimator(const void * contxt,
+                              const struct H264Context *ctx,
+                              const struct H264SliceContext *slice_ctx,
+                              unsigned int *index) {
+      check_new_frame(ctx);
+      auto key = make_model_key(contxt, ctx, slice_ctx, index);
       auto where = estimators.find(key);
       if (where!= estimators.end()) {
           return where->second;
@@ -260,6 +390,9 @@ class compressor {
     if (av_file_map(input_filename.c_str(), &original_bytes, &original_size, 0, NULL) < 0) {
       throw std::invalid_argument("Failed to open file: " + input_filename);
     }
+    h264_context = nullptr;
+    h264_slice_context = nullptr;
+
   }
 
   ~compressor() {
@@ -288,7 +421,7 @@ class compressor {
   class cabac_decoder {
    public:
     cabac_decoder(compressor *c, CABACContext *ctx_in, const uint8_t *buf, int size) {
-      h264_context = nullptr;
+      parent = c;
       out = c->find_next_coded_block_and_emit_literal(buf, size);
       if (out == nullptr) {
         // We're skipping this block, so disable calls to our hooks.
@@ -306,23 +439,22 @@ class compressor {
       ::ff_reset_cabac_decoder(&ctx, buf, size);
 
       model = &c->model;
-      model->reset();
     }
     ~cabac_decoder() { assert(out == nullptr || out->has_cabac()); }
 
     int get(uint8_t *state) {
       int symbol = ::ff_get_cabac(&ctx, state);
       encoder.put(symbol, [&](range_t range){
-          return model->probability_for_state(range, state, h264_context); });
-      model->update_state(symbol, state, h264_context);
+          return model->probability_for_state(range, state, parent->h264_context, parent->h264_slice_context); });
+      model->update_state(symbol, state, parent->h264_context, parent->h264_slice_context);
       return symbol;
     }
 
     int get_bypass() {
       int symbol = ::ff_get_cabac_bypass(&ctx);
       encoder.put(symbol, [&](range_t range){
-          return model->probability_for_state(range, &model->bypass_context, h264_context); });
-      model->update_state(symbol, &model->bypass_context, h264_context);
+              return model->probability_for_state(range, &model->bypass_context, parent->h264_context, parent->h264_slice_context); });
+      model->update_state(symbol, &model->bypass_context, parent->h264_context, parent->h264_slice_context);
       return symbol;
     }
 
@@ -330,27 +462,30 @@ class compressor {
       int n = ::ff_get_cabac_terminate(&ctx);
       int symbol = (n != 0);
       encoder.put(symbol, [&](range_t range){
-          return model->probability_for_state(range, &model->terminate_context, h264_context); });
-      model->update_state(symbol, &model->terminate_context, h264_context);
+          return model->probability_for_state(range, &model->terminate_context, parent->h264_context, parent->h264_slice_context); });
+      model->update_state(symbol, &model->terminate_context, parent->h264_context, parent->h264_slice_context);
       if (symbol) {
         encoder.finish();
         out->set_cabac(&encoder_out[0], encoder_out.size());
       }
       return symbol;
     }
-    void set_h264_context(const struct H264Context *ctx) {
-      h264_context = ctx;
+    void set_h264_context(const struct H264Context *ctx, const struct H264SliceContext *slice_ctx) {
+      parent->h264_context = ctx;
+      parent->h264_slice_context = slice_ctx;
     }
+
    private:
     Recoded::Block *out;
     CABACContext ctx;
-
+    compressor *parent;
     h264_model *model;
-    const struct H264Context *h264_context;
     std::vector<uint8_t> encoder_out;
     recoded_code::encoder<std::back_insert_iterator<std::vector<uint8_t>>, uint8_t> encoder{
       std::back_inserter(encoder_out)};
   };
+  const struct H264Context *h264_context;
+  const struct H264SliceContext *h264_slice_context;
 
  private:
   Recoded::Block* find_next_coded_block_and_emit_literal(const uint8_t *buf, int size) {
@@ -472,13 +607,12 @@ class decompressor {
   class cabac_decoder {
    public:
     cabac_decoder(decompressor *d, CABACContext *ctx_in, const uint8_t *buf, int size) {
-      h264_context = nullptr;
+      parent = d;
       index = d->recognize_coded_block(buf, size);
       block = &d->in.block(index);
       out = &d->blocks[index];
       if (block->has_cabac()) {
         model = &d->model;
-        model->reset();
         decoder = std::make_unique<recoded_code::decoder<const char*, uint8_t>>(
             block->cabac().data(), block->cabac().data() + block->cabac().size());
       } else if (block->has_skip_coded() && block->skip_coded()) {
@@ -494,32 +628,33 @@ class decompressor {
 
     int get(uint8_t *state) {
       int symbol = decoder->get([&](range_t range){
-          return model->probability_for_state(range, state, h264_context); });
-      model->update_state(symbol, state, h264_context);
+              return model->probability_for_state(range, state, parent->h264_context, parent->h264_slice_context); });
+      model->update_state(symbol, state, parent->h264_context, parent->h264_slice_context);
       cabac_encoder.put(symbol, state);
       return symbol;
     }
 
     int get_bypass() {
       int symbol = decoder->get([&](range_t range){
-          return model->probability_for_state(range, &model->bypass_context, h264_context); });
-      model->update_state(symbol, &model->bypass_context, h264_context);
+              return model->probability_for_state(range, &model->bypass_context, parent->h264_context, parent->h264_slice_context); });
+      model->update_state(symbol, &model->bypass_context, parent->h264_context, parent->h264_slice_context);
       cabac_encoder.put_bypass(symbol);
       return symbol;
     }
 
     int get_terminate() {
       int symbol = decoder->get([&](range_t range){
-          return model->probability_for_state(range, &model->terminate_context, h264_context); });
-      model->update_state(symbol, &model->terminate_context, h264_context);
+              return model->probability_for_state(range, &model->terminate_context, parent->h264_context,parent-> h264_slice_context); });
+      model->update_state(symbol, &model->terminate_context, parent->h264_context, parent->h264_slice_context);
       cabac_encoder.put_terminate(symbol);
       if (symbol) {
         finish();
       }
       return symbol;
     }
-    void set_h264_context(const struct H264Context *ctx) {
-      h264_context = ctx;
+    void set_h264_context(const struct H264Context *ctx, const struct H264SliceContext *slice_ctx) {
+      parent->h264_context = ctx;
+      parent->h264_slice_context = slice_ctx;
     }
 
    private:
@@ -542,8 +677,10 @@ class decompressor {
     std::vector<uint8_t> cabac_out;
     cabac::encoder<std::back_insert_iterator<std::vector<uint8_t>>> cabac_encoder{
       std::back_inserter(cabac_out)};
-    const struct H264Context *h264_context;
+    decompressor *parent;
   };
+  const struct H264Context *h264_context;
+  const struct H264SliceContext *h264_slice_context;
 
  private:
   // Return a unique 8-byte string containing no zero bytes (NAL-encoding-safe).
