@@ -3,7 +3,9 @@ avrecode: lossless re-compression of compressed video streams
 
 avrecode reads an already-compressed video file and writes a more compressed
 file. Unlike transcoding, which loses fidelity, the compression algorithm used
-by avrecode is reversible. The decompressed bytes exactly match the original
+by avrecode is bit-for-bit reversible.
+
+The decompressed bytes exactly match the original
 input file. However, avrecode's compressed format can only be read by avrecode
 -- an avrecode-compressed file cannot be played directly by standard software.
 
@@ -46,7 +48,6 @@ cd ..
 make
 ./recode roundtrip data/GOPR4542.MP4
 ```
-
 
 License
 -------
